@@ -8,7 +8,7 @@ import json
 import math
 import time
 import wave
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -366,26 +366,43 @@ class RealtimeDuplexClient:
         *,
         chunk_ms: int = 200,
         realtime: bool = True,
+        video_frames: Sequence[str] | None = None,
+        video_frame_interval_ms: int = 1000,
     ) -> None:
+        """Stream PCM16 audio, optionally interleaving omni-duplex camera frames.
+
+        ``video_frames`` are base64-encoded JPEG/PNG images. One frame is attached
+        roughly every ``video_frame_interval_ms`` of streamed audio regardless of
+        ``chunk_ms``, matching the Realtime wire contract of ~1 frame per 1 s chunk.
+        Streaming continues without frames once the sequence is exhausted.
+        """
         chunk_bytes = max(
             PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * chunk_ms // 1000,
             PCM16_BYTES_PER_SAMPLE,
         )
+        frames = list(video_frames or ())
+        frame_index = 0
+        next_frame_at_ms = 0
         audio_end_ms = 0
         for offset in range(0, len(pcm16), chunk_bytes):
             chunk = pcm16[offset : offset + chunk_bytes]
             duration_ms = len(chunk) * 1000 // (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
+            event: dict[str, Any] = {
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(chunk).decode("ascii"),
+                "input_audio_format": "pcm16",
+                "sample_rate_hz": PCM16_SAMPLE_RATE,
+                "duration_ms": duration_ms,
+                "audio_end_ms": audio_end_ms + duration_ms,
+            }
+            if frame_index < len(frames) and audio_end_ms >= next_frame_at_ms:
+                event["video_frames"] = [frames[frame_index]]
+                # HD slicing is rejected by the duplex Realtime adapter.
+                event["max_slice_nums"] = 1
+                frame_index += 1
+                next_frame_at_ms += video_frame_interval_ms
             audio_end_ms += duration_ms
-            await self.send(
-                {
-                    "type": "input_audio_buffer.append",
-                    "audio": base64.b64encode(chunk).decode("ascii"),
-                    "input_audio_format": "pcm16",
-                    "sample_rate_hz": PCM16_SAMPLE_RATE,
-                    "duration_ms": duration_ms,
-                    "audio_end_ms": audio_end_ms,
-                }
-            )
+            await self.send(event)
             if realtime:
                 await asyncio.sleep(duration_ms / 1000)
 

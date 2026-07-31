@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import io
 import json
 import sys
 import time
@@ -175,10 +176,52 @@ def _ref_audio_data_url(path: str | None) -> str | None:
     return "data:audio/wav;base64," + base64.b64encode(ref_path.read_bytes()).decode("ascii")
 
 
+def _load_video_frames(path: str | None, fps: float) -> list[str]:
+    """Return base64 JPEG/PNG frames for the omni-duplex camera channel.
+
+    Accepts either a directory of images or a video file, which is decoded and
+    sampled at ``fps``. The Realtime adapter expects roughly one frame per 1 s
+    audio chunk, so the default of 1 fps matches the wire contract.
+    """
+    if path is None:
+        return []
+    source = Path(path).expanduser()
+    if source.is_dir():
+        images = sorted(p for p in source.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png"})
+        if not images:
+            raise ValueError(f"no JPEG/PNG frames found in {source}")
+        return [base64.b64encode(p.read_bytes()).decode("ascii") for p in images]
+
+    if fps <= 0:
+        raise ValueError("--video-fps must be positive")
+    # Imported lazily so the audio-only path keeps working without a video decoder.
+    import av  # noqa: PLC0415
+    from PIL import Image  # noqa: F401, PLC0415
+
+    interval_s = 1.0 / fps
+    next_at_s = 0.0
+    frames: list[str] = []
+    with av.open(str(source)) as container:
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        for frame in container.decode(stream):
+            if frame.time is None or frame.time + 1e-6 < next_at_s:
+                continue
+            buffer = io.BytesIO()
+            frame.to_image().save(buffer, format="JPEG", quality=85)
+            frames.append(base64.b64encode(buffer.getvalue()).decode("ascii"))
+            next_at_s += interval_s
+    if not frames:
+        raise ValueError(f"no video frames decoded from {source}")
+    return frames
+
+
 async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     input_pcm16 = read_pcm16_wav(Path(args.input_wav))
     if not input_pcm16:
         raise ValueError("input WAV has no audio")
+
+    video_frames = _load_video_frames(args.video, args.video_fps)
 
     output_dir = Path(args.output_dir)
     stream_writer = _StreamingOutputWriter(output_dir)
@@ -203,6 +246,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             input_pcm16,
             chunk_ms=args.chunk_ms,
             realtime=not args.no_realtime_pacing,
+            video_frames=video_frames or None,
         )
         commit_event_cursor = len(client.events.events)
         stream_decision = _latest_model_decision(client.events.events, stream_event_cursor)
@@ -309,6 +353,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                 and (bool(audio) or not args.require_audio)
             ),
             "model_decision": model_decision,
+            "video_frames_sent": len(video_frames),
             "post_commit": {
                 "input_committed_event_index": committed_index,
                 "decision": post_commit_decision,
@@ -378,6 +423,22 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Reference WAV for the MiniCPM-o duplex assistant voice. "
             "This demo matches the official flow by always providing a reference audio clip."
+        ),
+    )
+    parser.add_argument(
+        "--video",
+        help=(
+            "Optional omni-duplex camera channel: a video file, or a directory of "
+            "JPEG/PNG frames sent in filename order."
+        ),
+    )
+    parser.add_argument(
+        "--video-fps",
+        type=float,
+        default=1.0,
+        help=(
+            "Frames sampled per second when --video is a video file. The Realtime "
+            "adapter expects ~1 frame per 1 s audio chunk (default: 1)."
         ),
     )
     parser.add_argument("--output-dir", default="/tmp/minicpmo_realtime_duplex_demo")
