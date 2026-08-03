@@ -3663,12 +3663,7 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
 
             if isinstance(audios, MiniCPMOAudioEmbeddingItems):
                 single_audio_embeds = audios.get(item_idx)["audio_embeds"]
-                # ``MiniCPMOAudioEmbeddingInputs`` declares ``TensorShape("bn", "s", "h")``,
-                # so one item is ``(s, h)`` and ``s`` -- its leading dim -- is the number of
-                # audio embedding vectors. ``sum(map(len, ...))`` instead iterated the rows
-                # and summed the hidden size, yielding ``s * h``: a 1 s slice of shape
-                # ``(10, 4096)`` requested 40960 placeholder tokens instead of 10, so any
-                # real request exceeded ``max_model_len``.
+                # One item is ``(s, h)``, so its leading dim is the audio embedding count.
                 audio_len = self.info.get_audio_len_by_num_chunks(len(single_audio_embeds))
             else:
                 audio_len = audios.get_audio_length(item_idx)
